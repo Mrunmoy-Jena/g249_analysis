@@ -114,6 +114,7 @@ struct GammaClusters
         std::vector<double> e;     // cluster energy   [keV] (lab frame)
         std::vector<double> theta; // cluster centroid theta [rad]
         std::vector<double> phi;   // cluster centroid phi   [rad]
+        std::vector<int>    crystalID; // mother-crystal ID (for exact geometry lookup)
 };
 
 // ─── Free helpers ───────────────────────────────────────────────────────────
@@ -468,6 +469,48 @@ static ROOT::RDF::RNode defineOutgoingStartPos(ROOT::RDF::RNode node)
                     { return p[2]; }, {"out_startpos"});
 }
 
+/// Reconstructed reaction VERTEX by closest approach (DCA) of the incoming and
+/// outgoing FOOT tracks — identical method to analyse_all_WR get_vertex().
+/// Produces vertex_x/y/z [cm] and vertex_dca [cm]. When either track is missing,
+/// all are set to the -999 sentinel.
+static ROOT::RDF::RNode defineReactionVertex(ROOT::RDF::RNode node)
+{
+        return node
+            .Define("vertex_vec",
+                    [](TClonesArray &intracks, TClonesArray &outtracks)
+                    {
+            std::array<double, 4> res = {-999.0, -999.0, -999.0, -999.0}; // x,y,z,dca
+            if (intracks.GetEntriesFast() == 0 || outtracks.GetEntriesFast() == 0)
+                return res;
+            auto *intrk  = (R3BTrackingParticle *)intracks.UncheckedAt(0);
+            auto *outtrk = (R3BTrackingParticle *)outtracks.UncheckedAt(0);
+            if (!intrk || !outtrk) return res;
+
+            const TVector3 pos1 = intrk->GetStartPosition();
+            const TVector3 pos2 = outtrk->GetStartPosition();
+            const TVector3 s1   = intrk->GetStartMomentum().Unit();
+            const TVector3 s2   = outtrk->GetStartMomentum().Unit();
+
+            // Closest approach of two lines (pos1,s1) and (pos2,s2).
+            const double s2s1 = s2.Dot(s1);
+            const double denom = 1.0 - s2s1 * s2s1;
+            if (std::abs(denom) < 1e-9) return res; // parallel tracks
+            const TVector3 dp = pos2 - pos1;
+            const double t = (-dp.Dot(s2) + dp.Dot(s1) * s2s1) / denom;
+            const double v = ( dp.Dot(s1) - dp.Dot(s2) * s2s1) / denom;
+            const TVector3 p1g = pos2 + t * s2;
+            const TVector3 p2g = pos1 + v * s1;
+            const TVector3 mid = 0.5 * (p1g + p2g);
+            const double dca = 0.5 * (p2g - p1g).Mag();
+
+            res = {mid.X(), mid.Y(), mid.Z(), dca};
+            return res; }, {"IncomingTrackFoot", "OutgoingTrackFoot"})
+            .Define("vertex_x",   [](const std::array<double, 4> &v) { return v[0]; }, {"vertex_vec"})
+            .Define("vertex_y",   [](const std::array<double, 4> &v) { return v[1]; }, {"vertex_vec"})
+            .Define("vertex_z",   [](const std::array<double, 4> &v) { return v[2]; }, {"vertex_vec"})
+            .Define("vertex_dca", [](const std::array<double, 4> &v) { return v[3]; }, {"vertex_vec"});
+}
+
 // ─── CALIFA ─────────────────────────────────────────────────────────────────
 
 static Top2Clusters findTop2Clusters(TClonesArray &clu,
@@ -527,6 +570,10 @@ static GammaClusters collectGammaClusters(TClonesArray &clu,
                 g.e.push_back(E);
                 g.theta.push_back(hit->GetTheta());
                 g.phi.push_back(hit->GetPhi());
+                // Mother crystal = first (highest-energy) crystal of the cluster.
+                // Used downstream to look up the EXACT crystal-centre position from
+                // R3BCalifaGeometry (no CALIFA-radius assumption in Doppler corr.).
+                g.crystalID.push_back(hit->GetMotherCrystal());
         }
         return g;
 }
@@ -567,6 +614,8 @@ static ROOT::RDF::RNode defineCalifaColumns(ROOT::RDF::RNode node)
                            { return g.theta; }, {"califa_gamma"})
                    .Define("califa_gamma_phi", [](const GammaClusters &g)
                            { return g.phi; }, {"califa_gamma"})
+                   .Define("califa_gamma_crystalID", [](const GammaClusters &g)
+                           { return g.crystalID; }, {"califa_gamma"})
                    .Define("califa_gamma_mult", [](const GammaClusters &g)
                            { return (int)g.e.size(); }, {"califa_gamma"});
 
@@ -652,7 +701,8 @@ static std::vector<std::string> detectorColumns()
             "fib32X", "fib32Y", "ElossFib32",
             "fib33X", "fib33Y", "ElossFib33",
             "tofdX",
-            "out_startX", "out_startY", "out_startZ"};
+            "out_startX", "out_startY", "out_startZ",
+            "vertex_x", "vertex_y", "vertex_z", "vertex_dca"};
 }
 
 static std::vector<std::string> buildOutputColumns(bool hasNeutrons)
@@ -669,7 +719,8 @@ static std::vector<std::string> buildOutputColumns(bool hasNeutrons)
                                  "califa_theta_L", "califa_phi_L",
                                  "califa_theta_R", "califa_phi_R",
                                  "califa_gamma_E", "califa_gamma_theta",
-                                 "califa_gamma_phi", "califa_gamma_mult",
+                                 "califa_gamma_phi", "califa_gamma_crystalID",
+                                 "califa_gamma_mult",
                                  "px_frag", "py_frag", "pz_frag",
                                  "beta_proj"});
 
@@ -859,6 +910,7 @@ void eventFilter(std::string setting = "",
                                   { return F.Pz(); }, {"P4_frag"});
 
         df_out = defineOutgoingStartPos(df_out);
+        df_out = defineReactionVertex(df_out);
 
         // ── Snapshot (post-PID, includes in_AoQ / in_Z) ─────────────────────
         df_out.Snapshot("FilterDataTree", outFile,
